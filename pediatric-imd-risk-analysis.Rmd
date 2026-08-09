@@ -1,0 +1,1066 @@
+---
+title: "Septic-Shock-or-Mortality-in-Pediatric-Invasive-Meningococcal-Disease"
+author: "Research Team"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+params:
+  data_path: "simulated_pediatric_IMD_data.csv"
+  B_boot: 300
+  m_imputations: 50
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 6,
+  dpi = 300
+)
+options(stringsAsFactors = FALSE, scipen = 999)
+set.seed(20260802)
+```
+
+# 1. Objective and Main Methodological Caution
+
+This document reproduces the previous analysis, identifies the issues requiring correction, and proposes a more transparent strategy for addressing Comment 4 from Reviewer 3. The objective is not to turn the study into a validated prediction model, but to estimate **factors associated** with the composite outcome of septic shock or death.
+
+Review of the original code identified an important issue: `complete.cases()` was applied simultaneously to the outcome and 16 candidate variables, including `lactate_above_20`, which has a substantial proportion of missing values. Consequently, the original AIC selection and Firth logistic regression were performed on a smaller subset than the full cohort. This issue should be reported explicitly and evaluated through sensitivity analyses.
+
+# 2. Packages and Reproducibility
+
+All packages are loaded explicitly. Exact versions are recorded at the end using `sessionInfo()` and `packageVersion()`; this information should be incorporated into the Methods section of the manuscript.
+
+```{r packages}
+packages <- c(
+  "readr", "dplyr", "tidyr", "purrr", "stringr", "tibble",
+  "ggplot2", "scales", "knitr", "MASS", "logistf", "brglm2",
+  "detectseparation", "glmnet", "mice", "pROC"
+)
+
+missing_packages <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "The following packages are missing: ", paste(missing_packages, collapse = ", "),
+    ". Install them with install.packages(c(",
+    paste(sprintf("'%s'", missing_packages), collapse = ", "), "))."
+  )
+}
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(MASS)
+library(logistf)
+library(brglm2)
+library(detectseparation)
+library(glmnet)
+library(mice)
+library(pROC)
+
+results_dir <- "reviewer3_comment4_results"
+dir.create(results_dir, showWarnings = FALSE)
+```
+
+
+# 3. Data Import and Verification
+
+```{r data-import}
+data_path <- params$data_path
+if (!file.exists(data_path)) {
+  stop(
+    "The file was not found: ", data_path,
+    ". Place simulated_pediatric_IMD_data.csv in the same folder as this Rmd file or modify params$data_path."
+  )
+}
+
+raw_data <- read_csv(data_path, show_col_types = FALSE)
+
+# Map the original Spanish column names to the English aliases used below.
+column_name_map <- c(
+  "fallecio_shock" = "died_or_shock",
+  "edad_menor1" = "age_under_1",
+  "comorbilidad" = "comorbidity",
+  "ceg" = "toxic_appearance",
+  "somnolencia_irritablidad" = "drowsiness_irritability",
+  "hipotension" = "hypotension",
+  "llenado_capilar_prol" = "prolonged_capillary_refill",
+  "peteq_purp" = "petechiae_purpura",
+  "deficit_neurologico_focal" = "focal_neurologic_deficit",
+  "convulsion" = "seizure_at_admission",
+  "convulsiones" = "seizures_during_hospitalization",
+  "dx_meningitis" = "meningitis",
+  "dx_meningococcemia" = "meningococcemia",
+  "dx_meningitis_meningococcemia" = "meningitis_meningococcemia",
+  "dx_artritis_septica" = "septic_arthritis",
+  "insuficiencia_suprarrenal" = "adrenal_insufficiency",
+  "lactato_alto_20" = "lactate_above_20",
+  "uci" = "icu_admission",
+  "falla_multi_org" = "multiorgan_failure",
+  "signos_isquemia_extremidades" = "limb_ischemia_signs",
+  "men_w" = "serogroup_w",
+  "men_b" = "serogroup_b",
+  "shock_final" = "septic_shock",
+  "fallecio" = "death",
+  "sexo" = "sex",
+  "diagnostico_final" = "final_diagnosis"
+)
+
+mapped_names <- unname(column_name_map[names(raw_data)])
+names(raw_data) <- ifelse(is.na(mapped_names), names(raw_data), mapped_names)
+
+cat("Dataset dimensions:", nrow(raw_data), "rows and", ncol(raw_data), "columns.\n")
+stopifnot("died_or_shock" %in% names(raw_data))
+```
+
+
+## 3.1 Recoding Functions
+
+```{r recoding}
+recode_binary <- function(x) {
+  if (is.logical(x)) {
+    return(as.integer(x))
+  }
+
+  if (is.numeric(x) || is.integer(x)) {
+    return(dplyr::case_when(
+      x == 1 ~ 1L,
+      x == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    ))
+  }
+
+  value <- stringr::str_to_upper(stringr::str_trim(as.character(x)))
+  dplyr::case_when(
+    value %in% c("YES", "Y", "SI", "SÍ", "1", "TRUE") ~ 1L,
+    value %in% c("NO", "N", "0", "FALSE") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+}
+
+available_binary_vars <- c(
+  "age_under_1", "comorbidity", "toxic_appearance", "drowsiness_irritability",
+  "hypotension", "prolonged_capillary_refill", "petechiae_purpura",
+  "focal_neurologic_deficit", "seizure_at_admission", "seizures_during_hospitalization",
+  "meningitis", "meningococcemia",
+  "meningitis_meningococcemia", "septic_arthritis",
+  "adrenal_insufficiency", "lactate_above_20", "icu_admission",
+  "multiorgan_failure", "limb_ischemia_signs", "serogroup_w", "serogroup_b",
+  "septic_shock", "death", "died_or_shock"
+)
+available_binary_vars <- intersect(available_binary_vars, names(raw_data))
+
+data <- raw_data %>%
+  mutate(across(all_of(available_binary_vars), recode_binary)) %>%
+  mutate(
+    male_sex = case_when(
+      str_to_upper(str_trim(as.character(sex))) %in%
+        c("M", "MALE", "MASC", "MASCULINO") ~ 1L,
+      str_to_upper(str_trim(as.character(sex))) %in%
+        c("F", "FEMALE", "FEM", "FEMENINO") ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    adverse_outcome = died_or_shock,
+    shock = septic_shock,
+    death_outcome = death
+  )
+
+if (any(!data$adverse_outcome %in% c(0, 1))) {
+  stop("The outcome was not correctly coded as 0/1.")
+}
+
+outcome_summary <- data %>%
+  summarise(
+    N = n(),
+    events = sum(adverse_outcome == 1, na.rm = TRUE),
+    non_events = sum(adverse_outcome == 0, na.rm = TRUE),
+    shock = sum(shock == 1, na.rm = TRUE),
+    deaths = sum(death_outcome == 1, na.rm = TRUE)
+  )
+
+kable(outcome_summary, caption = "Outcome verification")
+```
+
+
+# 4. Transparent Definition of Candidate Variables
+
+Variable selection should not depend exclusively on univariable p-values. Candidate variables are classified according to clinical relevance, temporal availability, completeness, and conceptual redundancy. Variables recorded during hospitalization or belonging to the same severity process are reserved for secondary analyses.
+
+```{r candidate-dictionary}
+candidate_dictionary <- tribble(
+  ~variable, ~label, ~domain, ~timing, ~recommended_use,
+  "age_under_1", "Age <12 months", "Demographic", "Admission", "Clinical candidate",
+  "male_sex", "Male sex", "Demographic", "Admission", "Clinical candidate",
+  "comorbidity", "Any comorbidity", "Medical history", "Before admission", "Clinical candidate",
+  "toxic_appearance", "Toxic appearance/impaired general condition", "Clinical severity", "Admission", "Assess redundancy",
+  "drowsiness_irritability", "Drowsiness or irritability", "Neurologic", "Admission", "Primary candidate",
+  "hypotension", "Hypotension", "Perfusion", "Admission", "Select using clinical judgment relative to capillary refill",
+  "prolonged_capillary_refill", "Prolonged capillary refill", "Perfusion", "Admission", "Primary candidate",
+  "petechiae_purpura", "Petechiae or purpura", "Cutaneous manifestation", "Admission", "Primary candidate",
+  "focal_neurologic_deficit", "Focal neurologic deficit", "Neurologic", "Admission", "Secondary candidate",
+  "seizure_at_admission", "Seizure recorded at admission", "Neurologic", "Admission", "Primary candidate",
+  "seizures_during_hospitalization", "Seizures recorded during hospitalization", "Neurologic", "Verify timing", "Sensitivity analysis; do not automatically substitute for seizure at admission",
+  "meningitis", "Isolated meningitis", "Clinical presentation", "Clinical diagnosis", "Extended model",
+  "meningitis_meningococcemia", "Meningitis with meningococcemia", "Clinical presentation", "Clinical diagnosis", "Do not include simultaneously with all categories",
+  "serogroup_b", "Serogroup B", "Microbiology", "Microbiological result", "Extended model",
+  "serogroup_w", "Serogroup W", "Microbiology", "Microbiological result", "Do not include simultaneously with serogroup B without a clear reference category",
+  "lactate_above_20", "Lactate >20 mg/dL", "Laboratory", "Admission", "Sensitivity analysis with multiple imputation",
+  "icu_admission", "ICU admission", "Resource use/severity", "During hospitalization", "Exclude from the primary model",
+  "multiorgan_failure", "Multiorgan failure", "Severe complication", "During clinical course", "Exclude from the primary model; include only as a secondary association",
+  "adrenal_insufficiency", "Adrenal insufficiency", "Severe complication", "During clinical course", "Descriptive/sensitivity analysis",
+  "limb_ischemia_signs", "Limb ischemia", "Severe complication", "During clinical course", "Descriptive/sensitivity analysis"
+)
+
+kable(candidate_dictionary, caption = "Proposed framework for defining candidate variables")
+```
+
+# 5. Missing Data and the Effect of `complete.cases()`
+
+## 5.1 Missingness Profile
+
+```{r missingness}
+variables_to_audit <- unique(c(candidate_dictionary$variable, "adverse_outcome"))
+variables_to_audit <- intersect(variables_to_audit, names(data))
+
+missingness_table <- tibble(
+  variable = variables_to_audit,
+  n_available = map_int(variables_to_audit, ~ sum(!is.na(data[[.x]]))),
+  n_missing = map_int(variables_to_audit, ~ sum(is.na(data[[.x]])))
+) %>%
+  mutate(pct_missing = 100 * n_missing / nrow(data)) %>%
+  left_join(candidate_dictionary %>% dplyr::select(variable, label), by = "variable") %>%
+  mutate(label = coalesce(label, variable)) %>%
+  arrange(desc(pct_missing))
+
+kable(
+  missingness_table %>%
+    mutate(pct_missing = sprintf("%.1f%%", pct_missing)),
+  caption = "Availability of the variables considered"
+)
+
+missingness_plot <- missingness_table %>%
+  filter(n_missing > 0) %>%
+  ggplot(aes(x = reorder(label, pct_missing), y = pct_missing)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = label_percent(scale = 1), limits = c(0, 100)) +
+  labs(
+    title = "Proportion of missing data",
+    x = NULL,
+    y = "Missing percentage"
+  ) +
+  theme_minimal(base_size = 12)
+
+missingness_plot
+ggsave(file.path(results_dir, "01_missingness.png"), missingness_plot, width = 9, height = 6, dpi = 300)
+```
+
+## 5.2 Reproduction of the Dataset Used in the Original Code
+
+```{r original-complete-cases}
+original_candidate_vars <- c(
+  "hypotension", "toxic_appearance", "drowsiness_irritability", "petechiae_purpura",
+  "prolonged_capillary_refill", "meningitis", "meningitis_meningococcemia",
+  "septic_arthritis", "adrenal_insufficiency", "lactate_above_20",
+  "icu_admission", "multiorgan_failure", "focal_neurologic_deficit", "seizures_during_hospitalization",
+  "serogroup_w", "serogroup_b"
+)
+original_candidate_vars <- intersect(original_candidate_vars, names(data))
+
+original_complete_case_data <- data %>%
+  dplyr::select(adverse_outcome, dplyr::all_of(original_candidate_vars)) %>%
+  drop_na()
+
+complete_case_summary <- tibble(
+  dataset = c("Full cohort", "Complete cases for the 16 original candidate variables"),
+  N = c(nrow(data), nrow(original_complete_case_data)),
+  events = c(sum(data$adverse_outcome), sum(original_complete_case_data$adverse_outcome)),
+  cohort_percentage = c(100, 100 * nrow(original_complete_case_data) / nrow(data))
+)
+
+kable(
+  complete_case_summary %>% mutate(cohort_percentage = sprintf("%.1f%%", cohort_percentage)),
+  caption = "Effect of complete-case analysis applied to the original candidate set"
+)
+```
+
+**Interpretation:** including a variable with substantial missingness in the selection matrix causes patients with complete information for the variables ultimately selected to be removed before model selection and fitting. Therefore, the primary analysis should not apply `complete.cases()` to a broad candidate set without reporting how many patients and events are excluded.
+
+# 6. Univariable Analysis: Descriptive Use Rather Than Automatic Screening
+
+Univariable Firth logistic regressions are estimated. P-values are presented for exploratory purposes; a rigid significance threshold is not recommended as the sole rule for deciding which variables enter the multivariable model.
+
+```{r univariable-function}
+extract_logistf <- function(fit, model_name = NA_character_) {
+  beta <- coef(fit)
+  ci_beta <- suppressMessages(confint(fit))
+
+  if (is.vector(ci_beta)) {
+    ci_beta <- matrix(ci_beta, nrow = 1)
+  }
+
+  pval <- fit$prob
+
+  if (is.null(pval)) {
+    pval <- rep(NA_real_, length(beta))
+  }
+
+  tibble::tibble(
+    model = model_name,
+    term = names(beta),
+    beta = unname(beta),
+    OR = exp(beta),
+    CI95_lower = exp(ci_beta[, 1]),
+    CI95_upper = exp(ci_beta[, 2]),
+    p = unname(pval)
+  )
+}
+
+
+fit_univariable_firth <- function(variable) {
+
+  univariable_data <- data %>%
+    dplyr::select(
+      adverse_outcome,
+      tidyselect::all_of(variable)
+    ) %>%
+    tidyr::drop_na()
+
+  if (
+    dplyr::n_distinct(univariable_data[[variable]]) < 2 ||
+    dplyr::n_distinct(univariable_data$adverse_outcome) < 2
+  ) {
+    return(
+      tibble::tibble(
+        variable = variable,
+        N = nrow(univariable_data),
+        events = sum(univariable_data$adverse_outcome),
+        OR = NA_real_,
+        CI95_lower = NA_real_,
+        CI95_upper = NA_real_,
+        p = NA_real_
+      )
+    )
+  }
+
+  fit <- logistf::logistf(
+    reformulate(variable, response = "adverse_outcome"),
+    data = univariable_data,
+    pl = TRUE
+  )
+
+  res <- extract_logistf(fit) %>%
+    dplyr::filter(term != "(Intercept)")
+
+  tibble::tibble(
+    variable = variable,
+    N = nrow(univariable_data),
+    events = sum(univariable_data$adverse_outcome),
+    OR = res$OR,
+    CI95_lower = res$CI95_lower,
+    CI95_upper = res$CI95_upper,
+    p = res$p
+  )
+}
+
+
+univariable_vars <- intersect(
+  c(
+    "age_under_1",
+    "male_sex",
+    "comorbidity",
+    "toxic_appearance",
+    "drowsiness_irritability",
+    "hypotension",
+    "prolonged_capillary_refill",
+    "petechiae_purpura",
+    "focal_neurologic_deficit",
+    "seizure_at_admission",
+    "seizures_during_hospitalization",
+    "meningitis",
+    "meningitis_meningococcemia",
+    "serogroup_b",
+    "serogroup_w",
+    "lactate_above_20",
+    "multiorgan_failure",
+    "adrenal_insufficiency",
+    "limb_ischemia_signs",
+    "icu_admission"
+  ),
+  names(data)
+)
+
+
+univariable_table <- purrr::map_dfr(
+  univariable_vars,
+  fit_univariable_firth
+) %>%
+  dplyr::left_join(
+    candidate_dictionary %>%
+      dplyr::select(variable, label, timing),
+    by = "variable"
+  ) %>%
+  dplyr::mutate(
+    label = dplyr::coalesce(label, variable),
+
+    OR_CI = dplyr::if_else(
+      is.na(OR),
+      "Not estimable",
+      sprintf("%.2f (%.2f–%.2f)", OR, CI95_lower, CI95_upper)
+    ),
+
+    p_formatted = dplyr::case_when(
+      is.na(p) ~ "—",
+      p < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p)
+    )
+  ) %>%
+  dplyr::arrange(p)
+
+
+knitr::kable(
+  univariable_table %>%
+    dplyr::select(
+      label,
+      timing,
+      N,
+      events,
+      OR_CI,
+      p_formatted
+    ),
+  col.names = c(
+    "Variable",
+    "Timing",
+    "N",
+    "Events",
+    "OR (95% CI)",
+    "p"
+  ),
+  caption = "Univariable Firth logistic regressions (exploratory)"
+)
+
+
+write.csv(
+  univariable_table,
+  file.path(
+    results_dir,
+    "univariable_firth_results.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+# 7. Collinearity, Redundancy, and Clinical Overlap
+
+Numerical collinearity and clinical overlap are related but distinct concerns. They are evaluated using phi correlations among binary variables, variance inflation factors, and contingency tables for variables that may represent the same severity process.
+
+## 7.1 Phi Correlation Matrix
+
+```{r phi-correlations}
+phi_vars <- intersect(
+  c(
+    "toxic_appearance", "drowsiness_irritability", "hypotension", "prolonged_capillary_refill",
+    "petechiae_purpura", "focal_neurologic_deficit", "seizure_at_admission", "seizures_during_hospitalization",
+    "lactate_above_20", "icu_admission", "multiorgan_failure", "adrenal_insufficiency",
+    "limb_ischemia_signs", "meningitis",
+    "meningitis_meningococcemia", "serogroup_b", "serogroup_w"
+  ),
+  names(data)
+)
+
+phi_matrix <- cor(data[, phi_vars], use = "pairwise.complete.obs", method = "pearson")
+phi_long <- as.data.frame(as.table(phi_matrix)) %>%
+  as_tibble() %>%
+  rename(variable_1 = Var1, variable_2 = Var2, phi = Freq)
+
+p_phi <- ggplot(phi_long, aes(variable_1, variable_2, fill = phi)) +
+  geom_tile() +
+  scale_fill_gradient2(limits = c(-1, 1), midpoint = 0) +
+  coord_equal() +
+  labs(
+    title = "Phi correlations among binary variables",
+    x = NULL, y = NULL, fill = "Phi"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 55, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+p_phi
+ggsave(file.path(results_dir, "02_phi_matrix.png"), p_phi, width = 11, height = 9, dpi = 300)
+
+phi_pairs <- phi_long %>%
+  filter(as.character(variable_1) < as.character(variable_2)) %>%
+  mutate(abs_phi = abs(phi)) %>%
+  arrange(desc(abs_phi))
+
+kable(head(phi_pairs, 15), digits = 3, caption = "Pairs with the largest absolute correlations")
+```
+
+## 7.2 VIF for the Original Final Model and the Admission Clinical Model
+
+```{r vif-assessment}
+calculate_vif <- function(data, variables) {
+  dat <- data %>% dplyr::select(all_of(variables)) %>% drop_na()
+
+  map_dfr(variables, function(v) {
+    other_variables <- setdiff(variables, v)
+    if (length(other_variables) == 0) return(tibble(variable = v, VIF = 1))
+    mod <- lm(reformulate(other_variables, response = v), data = dat)
+    r2 <- summary(mod)$r.squared
+    tibble(variable = v, VIF = 1 / (1 - r2))
+  })
+}
+
+original_final_vars <- intersect(
+  c("multiorgan_failure", "serogroup_b", "drowsiness_irritability",
+    "meningitis", "seizures_during_hospitalization", "petechiae_purpura"),
+  names(data)
+)
+
+admission_model_vars <- intersect(
+  c("drowsiness_irritability", "prolonged_capillary_refill", "seizure_at_admission", "petechiae_purpura"),
+  names(data)
+)
+
+original_vif <- calculate_vif(data, original_final_vars) %>% mutate(model = "Original final model")
+admission_vif <- calculate_vif(data, admission_model_vars) %>% mutate(model = "Admission clinical model")
+
+kable(bind_rows(original_vif, admission_vif), digits = 2, caption = "Variance inflation factors")
+```
+
+## 7.3 Outcome Overlap and Separation
+
+```{r separation-assessment}
+overlap_tables <- list(
+  multiorgan_failure = with(data, table(multiorgan_failure, adverse_outcome, useNA = "ifany")),
+  icu_admission = with(data, table(icu_admission, adverse_outcome, useNA = "ifany")),
+  limb_ischemia = with(data, table(limb_ischemia_signs, adverse_outcome, useNA = "ifany")),
+  adrenal_insufficiency = with(data, table(adrenal_insufficiency, adverse_outcome, useNA = "ifany"))
+)
+
+overlap_tables
+
+original_final_formula <- reformulate(original_final_vars, response = "adverse_outcome")
+original_final_data <- data %>% dplyr::select(adverse_outcome, all_of(original_final_vars)) %>% drop_na()
+
+separation_detection_model <- glm(
+  original_final_formula,
+  family = binomial(),
+  data = original_final_data,
+  method = detectseparation::detect_separation
+)
+
+separation_detection_model
+```
+
+**Recommended decision rule:** highly related variables representing the same clinical domain should not be included simultaneously. The primary model should avoid variables that occur after outcome onset or constitute complications of the same disease process. Multiorgan failure may be reported in a secondary model of associations during clinical progression, but it should not be interpreted as a baseline prognostic factor.
+
+# 8. Reproduction of the Original Procedure
+
+## 8.1 Forward AIC Selection Using the Original Complete Cases
+
+```{r original-aic-model}
+original_null_model <- glm(
+  adverse_outcome ~ 1,
+  family = binomial(),
+  data = original_complete_case_data
+)
+
+original_full_model <- glm(
+  reformulate(original_candidate_vars, response = "adverse_outcome"),
+  family = binomial(),
+  data = original_complete_case_data
+)
+
+original_forward_model <- stepAIC(
+  original_null_model,
+  scope = list(lower = original_null_model, upper = original_full_model),
+  direction = "forward",
+  trace = FALSE
+)
+
+formula(original_forward_model)
+AIC(original_forward_model)
+BIC(original_forward_model)
+summary(original_forward_model)
+```
+
+**Note:** forward AIC selection is reproduced to document the original procedure exactly, but it should not be presented as evidence of stability. In small samples, stepwise selection may produce overly large coefficients, optimistic p-values, and unstable variable inclusion.
+
+## 8.2 Original Firth Logistic Regression
+
+```{r original-firth-model}
+original_firth_model_48 <- logistf(
+  original_final_formula,
+  data = original_complete_case_data,
+  pl = TRUE
+)
+
+summary(original_firth_model_48)
+original_firth_table_48 <- extract_logistf(original_firth_model_48, "Original Firth: complete cases across candidate variables") %>%
+  filter(term != "(Intercept)")
+
+kable(
+  original_firth_table_48 %>%
+    mutate(OR_CI = sprintf("%.2f (%.3f–%.2f)", OR, CI95_lower, CI95_upper)) %>%
+    dplyr::select(term, OR_CI, p),
+  caption = "Reproduction of the original Firth model"
+)
+```
+
+# 9. Recommended Models and Sensitivity Analyses
+
+## 9.1 Model 1: Same Final Formula Refit in All 72 Patients
+
+The six variables selected in the original model have no missing data. Therefore, an immediate sensitivity analysis is to refit exactly the same formula in the full cohort. This analysis shows the extent to which the estimates depended on the earlier exclusion caused by missing values in other candidate variables.
+
+```{r firth-refit-72}
+final_data_72 <- data %>%
+  dplyr::select(adverse_outcome, all_of(original_final_vars)) %>%
+  drop_na()
+
+same_formula_firth_model_72 <- logistf(
+  original_final_formula,
+  data = final_data_72,
+  pl = TRUE
+)
+
+summary(same_formula_firth_model_72)
+```
+
+```{r}
+OR  <- exp(coef(same_formula_firth_model_72))
+CI <- exp(confint(same_formula_firth_model_72))
+
+result_table <- cbind(OR, CI)
+
+round(result_table, 3)
+```
+
+
+## 9.2 Model 2: Sensitivity Analysis Excluding Multiorgan Failure
+
+```{r firth-without-mof}
+vars_without_mof <- setdiff(original_final_vars, "multiorgan_failure")
+formula_without_mof <- reformulate(vars_without_mof, response = "adverse_outcome")
+data_without_mof <- data %>% dplyr::select(adverse_outcome, all_of(vars_without_mof)) %>% drop_na()
+
+firth_model_without_mof <- logistf(formula_without_mof, data = data_without_mof, pl = TRUE)
+summary(firth_model_without_mof)
+```
+
+## 9.3 Model 3: Parsimonious Clinical Model Using Admission Variables
+
+This model contains four degrees of freedom, one for each clinical domain: altered mental status, perfusion, seizure at admission, and cutaneous manifestations. With 28 events, the events-per-parameter ratio is 7.0. This is not interpreted as a mechanical rule, but as a way to limit model complexity given the sample size.
+
+```{r admission-firth-model}
+admission_formula <- adverse_outcome ~
+  drowsiness_irritability + prolonged_capillary_refill + seizure_at_admission + petechiae_purpura
+
+admission_data <- data %>%
+  dplyr::select(all_of(all.vars(admission_formula))) %>%
+  drop_na()
+
+admission_firth_model <- logistf(admission_formula, data = admission_data, pl = TRUE)
+summary(admission_firth_model)
+```
+
+## 9.4 Model 4: Extended Model Including Clinical Presentation and Serogroup
+
+This model is presented as an explanatory sensitivity analysis, not as a validated prediction model. It adds isolated meningitis and serogroup B to the admission clinical model.
+
+```{r extended-firth-model}
+extended_formula <- update(admission_formula, . ~ . + meningitis + serogroup_b)
+extended_data <- data %>% dplyr::select(all_of(all.vars(extended_formula))) %>% drop_na()
+
+extended_firth_model <- logistf(extended_formula, data = extended_data, pl = TRUE)
+summary(extended_firth_model)
+```
+
+## 9.5 Alternative Bias-Reduced Model (`brglm2`)
+
+```{r brglm2}
+admission_brglm_model <- glm(
+  admission_formula,
+  family = binomial("logit"),
+  data = admission_data,
+  method = brglm2::brglmFit,
+  type = "AS_mean"
+)
+
+extended_brglm_model <- glm(
+  extended_formula,
+  family = binomial("logit"),
+  data = extended_data,
+  method = brglm2::brglmFit,
+  type = "AS_mean"
+)
+
+summary(admission_brglm_model)
+summary(extended_brglm_model)
+```
+
+## 9.6 Comparison of Firth Models
+
+```{r model-comparison-table}
+firth_models <- list(
+  "Original_48" = original_firth_model_48,
+  "Same_formula_72" = same_formula_firth_model_72,
+  "Without_multiorgan_failure" = firth_model_without_mof,
+  "Admission_clinical" = admission_firth_model,
+  "Extended" = extended_firth_model
+)
+
+model_comparison_table <- imap_dfr(firth_models, ~ extract_logistf(.x, .y)) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR_CI = sprintf("%.2f (%.2f–%.2f)", OR, CI95_lower, CI95_upper),
+    p_formatted = case_when(p < 0.001 ~ "<0.001", TRUE ~ sprintf("%.3f", p))
+  )
+
+kable(
+  model_comparison_table %>% dplyr::select(model, term, OR_CI, p_formatted),
+  col.names = c("Model", "Variable", "OR (95% CI)", "p"),
+  caption = "Comparison of estimates across models"
+)
+
+write.csv(model_comparison_table, file.path(results_dir, "firth_model_comparison.csv"), row.names = FALSE)
+```
+
+## 9.7 Comparative Forest Plot
+
+```{r model-forest-plot}
+terms_to_show <- setdiff(unique(model_comparison_table$term), "(Intercept)")
+
+forest_plot <- model_comparison_table %>%
+  filter(term %in% terms_to_show) %>%
+  mutate(
+    term = factor(term, levels = rev(terms_to_show)),
+    model = factor(model, levels = names(firth_models))
+  ) %>%
+  ggplot(aes(x = OR, y = term, xmin = CI95_lower, xmax = CI95_upper, shape = model)) +
+  geom_vline(xintercept = 1, linetype = 2) +
+  geom_pointrange(position = position_dodge(width = 0.55)) +
+  scale_x_log10() +
+  labs(
+    title = "Sensitivity of odds ratios across models",
+    x = "Adjusted OR, logarithmic scale",
+    y = NULL,
+    shape = "Model"
+  ) +
+  theme_minimal(base_size = 11)
+
+forest_plot
+ggsave(file.path(results_dir, "03_model_forest_plot.png"), forest_plot, width = 11, height = 8, dpi = 300)
+```
+
+# 10. Ridge Regularization as an Alternative Analysis
+
+Ridge regression is not used to replace the primary Firth-based interpretation, but to assess whether the directions of association remain compatible when all coefficients are shrunk simultaneously. Given the sample size, cross-validation is interpreted cautiously.
+
+```{r ridge}
+ridge_vars <- intersect(
+  c(
+    "age_under_1", "male_sex", "comorbidity", "toxic_appearance",
+    "drowsiness_irritability", "hypotension", "prolonged_capillary_refill",
+    "petechiae_purpura", "focal_neurologic_deficit", "seizure_at_admission",
+    "meningitis", "meningitis_meningococcemia", "serogroup_b"
+  ),
+  names(data)
+)
+
+ridge_data <- data %>%
+  dplyr::select(adverse_outcome, all_of(ridge_vars)) %>%
+  drop_na()
+
+X_ridge <- model.matrix(
+  reformulate(ridge_vars, response = "adverse_outcome"),
+  data = ridge_data
+)[, -1, drop = FALSE]
+y_ridge <- ridge_data$adverse_outcome
+
+set.seed(20260802)
+cv_ridge <- cv.glmnet(
+  x = X_ridge,
+  y = y_ridge,
+  family = "binomial",
+  alpha = 0,
+  nfolds = 10,
+  type.measure = "deviance",
+  standardize = TRUE
+)
+
+plot(cv_ridge)
+abline(v = log(cv_ridge$lambda.1se), lty = 2)
+
+ridge_coef_matrix <- as.matrix(coef(cv_ridge, s = "lambda.1se"))
+ridge_coefficients <- tibble(
+  term = rownames(ridge_coef_matrix),
+  beta = as.numeric(ridge_coef_matrix[, 1]),
+  shrunk_OR = exp(beta)
+)
+
+kable(ridge_coefficients, digits = 3, caption = "Ridge coefficients at lambda.1se")
+write.csv(ridge_coefficients, file.path(results_dir, "ridge_coefficients.csv"), row.names = FALSE)
+```
+
+# 11. Stability of AIC Selection Assessed by Bootstrap
+
+This analysis does not validate stepwise selection; it quantifies its instability. A variable selected in only a small fraction of bootstrap samples should not be described as a robust finding.
+
+```{r bootstrap-selection, cache=TRUE}
+select_forward_one_sample <- function(data, outcome, candidates) {
+  eligible_candidates <- candidates[vapply(data[candidates], function(x) n_distinct(x, na.rm = TRUE) > 1, logical(1))]
+  if (length(eligible_candidates) == 0 || n_distinct(data[[outcome]]) < 2) return(character(0))
+
+  mod0 <- glm(as.formula(paste(outcome, "~ 1")), family = binomial(), data = data)
+  modf <- try(
+    glm(reformulate(eligible_candidates, response = outcome), family = binomial(), data = data),
+    silent = TRUE
+  )
+  if (inherits(modf, "try-error")) return(character(0))
+
+  stepwise_fit <- try(
+    suppressWarnings(stepAIC(
+      mod0,
+      scope = list(lower = mod0, upper = modf),
+      direction = "forward",
+      trace = FALSE
+    )),
+    silent = TRUE
+  )
+  if (inherits(stepwise_fit, "try-error")) return(character(0))
+  attr(terms(stepwise_fit), "term.labels")
+}
+
+bootstrap_candidates <- ridge_vars
+bootstrap_data <- data %>% dplyr::select(adverse_outcome, all_of(bootstrap_candidates)) %>% drop_na()
+
+set.seed(20260802)
+bootstrap_selections <- map(seq_len(params$B_boot), function(b) {
+  idx <- sample(seq_len(nrow(bootstrap_data)), size = nrow(bootstrap_data), replace = TRUE)
+  select_forward_one_sample(bootstrap_data[idx, , drop = FALSE], "adverse_outcome", bootstrap_candidates)
+})
+
+bootstrap_frequency <- tibble(variable = bootstrap_candidates) %>%
+  mutate(
+    frequency = map_dbl(variable, function(v) {
+      mean(map_lgl(bootstrap_selections, function(selection) v %in% selection))
+    }),
+    percentage = 100 * frequency
+  ) %>%
+  arrange(desc(frequency))
+
+kable(bootstrap_frequency, digits = 1, caption = "AIC selection frequency across bootstrap samples")
+
+bootstrap_plot <- ggplot(bootstrap_frequency, aes(x = reorder(variable, percentage), y = percentage)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 100), labels = label_percent(scale = 1)) +
+  labs(
+    title = "Stability of forward AIC selection",
+    subtitle = paste(params$B_boot, "bootstrap samples"),
+    x = NULL,
+    y = "Percentage of bootstrap samples in which the variable was selected"
+  ) +
+  theme_minimal(base_size = 11)
+
+bootstrap_plot
+ggsave(file.path(results_dir, "04_aic_selection_stability.png"), bootstrap_plot, width = 9, height = 7, dpi = 300)
+write.csv(bootstrap_frequency, file.path(results_dir, "bootstrap_selection_frequency.csv"), row.names = FALSE)
+```
+
+# 12. Coefficient Stability Assessed by Leave-One-Out Analysis
+
+```{r jackknife-firth, cache=TRUE}
+jackknife_logistf <- function(data, model_formula, model_name) {
+  map_dfr(seq_len(nrow(data)), function(i) {
+    fit_i <- try(logistf(model_formula, data = data[-i, , drop = FALSE], pl = FALSE), silent = TRUE)
+    if (inherits(fit_i, "try-error")) return(NULL)
+    tibble(
+      omitted_row = i,
+      model = model_name,
+      term = names(coef(fit_i)),
+      beta = unname(coef(fit_i)),
+      OR = exp(beta)
+    )
+  })
+}
+
+admission_jackknife <- jackknife_logistf(admission_data, admission_formula, "Admission clinical model") %>%
+  filter(term != "(Intercept)")
+
+jackknife_summary <- admission_jackknife %>%
+  group_by(term) %>%
+  summarise(
+    OR_min = min(OR, na.rm = TRUE),
+    OR_median = median(OR, na.rm = TRUE),
+    OR_max = max(OR, na.rm = TRUE),
+    sign_changes = any(beta < 0) && any(beta > 0),
+    .groups = "drop"
+  )
+
+kable(jackknife_summary, digits = 2, caption = "Coefficient sensitivity when one patient is omitted")
+
+jackknife_plot <- ggplot(admission_jackknife, aes(x = term, y = OR)) +
+  geom_hline(yintercept = 1, linetype = 2) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.12, alpha = 0.45) +
+  scale_y_log10() +
+  coord_flip() +
+  labs(
+    title = "Leave-one-out coefficient stability",
+    x = NULL,
+    y = "Adjusted OR, logarithmic scale"
+  ) +
+  theme_minimal(base_size = 11)
+
+jackknife_plot
+ggsave(file.path(results_dir, "05_jackknife_coefficients.png"), jackknife_plot, width = 9, height = 6, dpi = 300)
+```
+
+# 13. Multiple Imputation to Include Lactate in a Sensitivity Analysis
+
+Lactate should not automatically cause the exclusion of approximately one third of the cohort. A sensitivity analysis using multiple imputation by chained equations is proposed. The outcome remains observed and is used as a predictor in the imputation model, but is not itself imputed.
+
+```{r multiple-imputation, cache=TRUE}
+mi_formula <- adverse_outcome ~
+  drowsiness_irritability + prolonged_capillary_refill + seizure_at_admission +
+  meningitis + serogroup_b + lactate_above_20
+
+mi_vars <- all.vars(mi_formula)
+mi_data <- data %>% dplyr::select(all_of(mi_vars))
+
+imputation_method <- make.method(mi_data)
+imputation_method[] <- ""
+imputation_method["lactate_above_20"] <- "logreg"
+
+pred <- make.predictorMatrix(mi_data)
+diag(pred) <- 0
+pred["adverse_outcome", ] <- 0
+pred["lactate_above_20", "adverse_outcome"] <- 1
+
+set.seed(20260802)
+imp <- mice(
+  mi_data,
+  m = params$m_imputations,
+  method = imputation_method,
+  predictorMatrix = pred,
+  maxit = 20,
+  printFlag = FALSE,
+  seed = 20260802
+)
+
+mi_fits <- map(seq_len(params$m_imputations), function(i) {
+  dat_i <- complete(imp, i)
+  glm(
+    mi_formula,
+    family = binomial("logit"),
+    data = dat_i,
+    method = brglm2::brglmFit,
+    type = "AS_mean"
+  )
+})
+
+pool_rubin_manual <- function(model_list) {
+  betas <- do.call(cbind, lapply(model_list, coef))
+  vcovs <- lapply(model_list, vcov)
+  m <- ncol(betas)
+
+  q_bar <- rowMeans(betas)
+  u_bar <- Reduce(`+`, vcovs) / m
+  b_mat <- stats::cov(t(betas))
+  t_mat <- u_bar + (1 + 1 / m) * b_mat
+  se <- sqrt(diag(t_mat))
+
+  tibble(
+    term = names(q_bar),
+    beta = q_bar,
+    se = se,
+    OR = exp(beta),
+    CI95_lower = exp(beta - 1.96 * se),
+    CI95_upper = exp(beta + 1.96 * se),
+    p = 2 * pnorm(abs(beta / se), lower.tail = FALSE)
+  )
+}
+
+mi_table <- pool_rubin_manual(mi_fits) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(OR_CI = sprintf("%.2f (%.2f–%.2f)", OR, CI95_lower, CI95_upper))
+
+kable(mi_table %>% dplyr::select(term, OR_CI, p), caption = "Sensitivity analysis using multiple imputation and bias reduction")
+write.csv(mi_table, file.path(results_dir, "multiple_imputation_results.csv"), row.names = FALSE)
+```
+
+# 14. Sensitivity Analysis of the Composite Outcome
+
+With 23 episodes of shock and five deaths, fitting a multivariable model for mortality is not advisable. The clinical model should instead be fitted for shock as a sensitivity analysis, while mortality should be reported separately using descriptive summaries or a very limited univariable analysis.
+
+```{r outcome-sensitivity}
+shock_formula <- update(admission_formula, shock ~ .)
+shock_data <- data %>% dplyr::select(all_of(all.vars(shock_formula))) %>% drop_na()
+shock_firth_model <- logistf(shock_formula, data = shock_data, pl = TRUE)
+summary(shock_firth_model)
+
+mortality_by_presentation <- raw_data %>%
+  count(final_diagnosis, death, name = "n") %>%
+  arrange(final_diagnosis, death)
+
+kable(mortality_by_presentation, caption = "Descriptive mortality by clinical presentation")
+```
+
+# 15. Apparent Performance: Descriptive Only
+
+The analysis is not presented as the development of a prediction model. Apparent AUC is shown only as a secondary diagnostic and must not be interpreted as external validation.
+
+```{r apparent-auc}
+admission_probabilities <- predict(admission_firth_model, type = "response")
+admission_roc <- roc(admission_data$adverse_outcome, admission_probabilities, quiet = TRUE)
+admission_auc <- as.numeric(auc(admission_roc))
+
+cat("Apparent AUC of the admission clinical model:", round(admission_auc, 3), "\n")
+plot(admission_roc, main = "Apparent ROC curve: admission clinical model")
+```
+
+# 16. Analytical Summary for the Manuscript
+
+1. The cohort includes `r nrow(data)` patients and `r sum(data$adverse_outcome)` adverse outcomes.
+2. The original set of 16 candidate variables reduces the analysis to `r nrow(original_complete_case_data)` patients and `r sum(original_complete_case_data$adverse_outcome)` events because of missing data, primarily for lactate.
+3. The original six-term model corresponds to approximately `r round(sum(original_complete_case_data$adverse_outcome)/length(original_final_vars), 1)` events per parameter in the sample used for model selection.
+4. Multiorgan failure exhibits separation with respect to the outcome and is also a complication arising during clinical progression. It should be excluded from the primary model of variables available at admission and retained, if desired, in a secondary model of associations during hospitalization.
+5. Comparing the original model, the refit in all 72 patients, the model excluding multiorgan failure, and the admission clinical model allows assessment of coefficient sensitivity.
+6. Bootstrap selection frequencies and leave-one-out analysis quantify instability that is not resolved merely by using Firth regression.
+7. For lactate, multiple imputation is a more defensible sensitivity analysis than excluding all patients without this measurement.
+8. Results should be described as **associations**, not as validation of clinical predictors.
+
+
+# 17. Software Version Record
+
+```{r software_versions}
+software_versions <- tibble(
+  component = c("R", "logistf", "brglm2", "detectseparation", "glmnet", "mice"),
+  version = c(
+    paste(R.version$major, R.version$minor, sep = "."),
+    as.character(packageVersion("logistf")),
+    as.character(packageVersion("brglm2")),
+    as.character(packageVersion("detectseparation")),
+    as.character(packageVersion("glmnet")),
+    as.character(packageVersion("mice"))
+  )
+)
+
+kable(software_versions, caption = "Software versions")
+write.csv(software_versions, file.path(results_dir, "software_versions.csv"), row.names = FALSE)
+
+capture.output(sessionInfo(), file = file.path(results_dir, "sessionInfo.txt"))
+```
