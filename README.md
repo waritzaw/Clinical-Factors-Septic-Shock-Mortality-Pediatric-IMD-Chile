@@ -27,7 +27,7 @@ This project is intended as an explanatory association analysis, not as the deve
 Files
 - simulated_pediatric_IMD_data.csv: Simulated pediatric IMD dataset used to reproduce the workflow without disclosing confidential patient data.
 
-- pediatric-imd-risk-analysis-english.Rmd: Complete analysis, including statistical methods, tables, figures, sensitivity analyses, and information on reproducibility.
+- pediatric-imd-risk-analysis.Rmd: Complete analysis, including statistical methods, tables, figures, sensitivity analyses, and information on reproducibility.
 
 The R Markdown analysis includes: data import, variable-name mapping, and binary recoding; outcome and data-quality verification. Transparent classification of candidate variables by clinical domain and timing; missing-data profiling and evaluation of the impact of `complete.cases()`; exploratory univariable Firth logistic regression; phi correlations, variance inflation factors, contingency tables, and separation diagnostics; reproduction of forward AIC selection and the original Firth model.
 
